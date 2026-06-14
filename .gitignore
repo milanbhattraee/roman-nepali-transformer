@@ -1,0 +1,8 @@
+cat <<EOF > .gitignore
+__pycache__/
+.DS_Store
+data/
+models/word_dictionary.json
+models/*.pt
+models/*.pth
+EOF
