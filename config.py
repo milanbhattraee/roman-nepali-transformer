@@ -44,12 +44,12 @@ class Config:
                                 # 1.0 ≈ doubles train set (same as original behaviour)
 
     # ── Evaluation ───────────────────────────────────────────────────────────
-    EVAL_EVERY       : int = 5    # run validation every N epochs
+    EVAL_EVERY       : int = 1    # run validation every N epochs
     MAX_EVAL_SAMPLES : int = 500  # max val pairs per eval run (0 = all)
 
     # ── Checkpointing ────────────────────────────────────────────────────────
     RESUME     : bool = True   # auto-resume from last_checkpoint.pt if found
-    SAVE_EVERY : int  = 10      # save periodic checkpoint every N epochs
+    SAVE_EVERY : int  = 1     # save periodic checkpoint every N epochs
 
     # ── Inference ────────────────────────────────────────────────────────────
     BEAM_WIDTH  : int = 5
