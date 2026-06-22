@@ -8,7 +8,7 @@ import os
 
 class Config:
     # ── Data ─────────────────────────────────────────────────────────────────
-    DATA_PATH   : str  = "data/roman_nepali_clean.csv"
+    DATA_PATH   : str  = "/kaggle/input/roman-nepali-transliteration-data/roman_nepali_clean.csv"
     MODEL_DIR   : str  = "models"
     NUM_WORKERS : int  = 0
 
