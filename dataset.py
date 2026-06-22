@@ -1,54 +1,52 @@
 """
-dataset.py  ─  Data pipeline for Roman Nepali → Devanagari
-═══════════════════════════════════════════════════════════════════════════════
-Handles everything data-related:
-  • Loading & extracting word pairs from the CSV
-  • Building character-level vocabularies
-  • Data augmentation (noise injection for robustness) — NOISE_PROB respected
-  • PyTorch Dataset + DataLoader creation
+dataset.py — Character-level Roman→Devanagari data pipeline.
 
-Fixes vs original
-──────────────────
-  • noise_prob was wired up but NEVER used — all pairs were always augmented.
-    Now NOISE_PROB controls what fraction of training pairs receive a noisy copy.
-  • Added a 4th augmentation type: random-char insertion (common typo).
-  • seed propagated into augment_pairs so runs are fully reproducible.
-  • CharTokenizer.save / load use integer keys consistently; no silent mismatch.
-  • _split_words handles full-width punctuation and zero-width joiner (ZWJ).
-═══════════════════════════════════════════════════════════════════════════════
+Handles TWO CSV formats automatically:
+
+  Format A (sentence-level, header row):
+      Romanized,Devanagari
+      Ma bajaarma kehi..., म बजारमा केही...
+
+  Format B (word-level, no header):
+      काहुँडाँडालगायतका,kahundandalgayatka
+      प्रह्रीको,prahriko
+
+Detection logic:
+  1. Read first non-empty line.
+  2. If it looks like a header (contains ASCII 'Romanized'/'Devanagari') → Format A.
+  3. Else check which column contains Devanagari Unicode → determines column order.
+
+Output is always a list of (roman_str, devanagari_str) word-level pairs.
 """
-
 from __future__ import annotations
 
 import csv
 import json
+import logging
 import os
 import random
 import re
-from collections import Counter
 from typing import Optional
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+logger = logging.getLogger(__name__)
 
-# ─── Special token indices ────────────────────────────────────────────────────
-PAD_IDX = 0   # padding (ignored by loss & attention)
-SOS_IDX = 1   # start of sequence
-EOS_IDX = 2   # end of sequence
-UNK_IDX = 3   # unknown character
+# ── Special token indices (must match model.py & trainer.py) ─────────────────
+PAD_IDX = 0
+SOS_IDX = 1
+EOS_IDX = 2
+UNK_IDX = 3
+EOW_IDX = 4   # End-of-Word — hard boundary that stops repetition loops
 
-_SPECIAL_TOKENS = ("<PAD>", "<SOS>", "<EOS>", "<UNK>")
+_SPECIAL = {"<PAD>", "<SOS>", "<EOS>", "<UNK>", "<EOW>"}
 
 
-# ─── Tokenizer ───────────────────────────────────────────────────────────────
-
+# ── Tokenizer ─────────────────────────────────────────────────────────────────
 class CharTokenizer:
-    """
-    Character-level tokeniser.
-    Builds a vocabulary of individual Unicode characters observed in the data.
-    """
+    """Character-level tokenizer with explicit special tokens."""
 
     def __init__(self) -> None:
         self.ch2id: dict[str, int] = {
@@ -56,145 +54,208 @@ class CharTokenizer:
             "<SOS>": SOS_IDX,
             "<EOS>": EOS_IDX,
             "<UNK>": UNK_IDX,
+            "<EOW>": EOW_IDX,
         }
         self.id2ch: dict[int, str] = {v: k for k, v in self.ch2id.items()}
 
-    # ── Build ─────────────────────────────────────────────────────────────────
-
     def build(self, texts: list[str]) -> "CharTokenizer":
-        """Extend vocabulary with every unique character found in *texts*."""
         chars: set[str] = set()
         for t in texts:
             chars.update(t)
-        for ch in sorted(chars):           # sorted → deterministic vocab order
+        for ch in sorted(chars):
             if ch not in self.ch2id:
                 idx = len(self.ch2id)
                 self.ch2id[ch] = idx
                 self.id2ch[idx] = ch
         return self
 
-    # ── Encode / Decode ───────────────────────────────────────────────────────
-
-    def encode(
-        self,
-        text: str,
-        add_sos: bool = False,
-        add_eos: bool = True,
-    ) -> list[int]:
+    def encode(self, text: str, add_sos: bool = False, add_eos: bool = True,
+               add_eow: bool = False) -> list[int]:
         ids: list[int] = []
         if add_sos:
             ids.append(SOS_IDX)
         for ch in text:
             ids.append(self.ch2id.get(ch, UNK_IDX))
+        if add_eow:
+            ids.append(EOW_IDX)
         if add_eos:
             ids.append(EOS_IDX)
         return ids
 
     def decode(self, ids: list[int]) -> str:
-        chars: list[str] = []
+        out: list[str] = []
         for i in ids:
             ch = self.id2ch.get(i, "")
             if ch == "<EOS>":
                 break
-            if ch not in _SPECIAL_TOKENS:
-                chars.append(ch)
-        return "".join(chars)
+            if ch not in _SPECIAL:
+                out.append(ch)
+        return "".join(out)
 
     @property
     def vocab_size(self) -> int:
         return len(self.ch2id)
 
-    # ── Persistence ───────────────────────────────────────────────────────────
-
     def save(self, path: str) -> None:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(
-                {
-                    "ch2id": self.ch2id,
-                    # Store int keys as strings — JSON only allows string keys
-                    "id2ch": {str(k): v for k, v in self.id2ch.items()},
-                },
-                f,
-                ensure_ascii=False,
-                indent=2,
+                {"ch2id": self.ch2id,
+                 "id2ch": {str(k): v for k, v in self.id2ch.items()}},
+                f, ensure_ascii=False, indent=2,
             )
 
     @classmethod
     def load(cls, path: str) -> "CharTokenizer":
         tok = cls()
         with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        tok.ch2id = data["ch2id"]
-        tok.id2ch = {int(k): v for k, v in data["id2ch"].items()}
+            d = json.load(f)
+        tok.ch2id = d["ch2id"]
+        tok.id2ch = {int(k): v for k, v in d["id2ch"].items()}
         return tok
 
     def __repr__(self) -> str:
         return f"CharTokenizer(vocab_size={self.vocab_size})"
 
 
-# ─── Word-pair extraction ─────────────────────────────────────────────────────
-
-# Extended punctuation: includes Unicode Devanagari danda (।), ellipsis, ZWJ, etc.
-_PUNCT_RE = re.compile(
-    r'[।,.!?;:"\(\)\[\]\-—…\'\u200b\u200c\u200d\u0964\u0965\u2018\u2019\u201c\u201d]'
+# ── CSV format detection ───────────────────────────────────────────────────────
+_DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
+_ROMAN_RE      = re.compile(r"^[a-zA-Z]")
+_PUNCT_RE      = re.compile(
+    r'[।,.!?;:"\(\)\[\]\-—…\'\u200b\u200c\u200d\u0964\u0965]'
 )
-
-_ROMAN_PAT    = re.compile(r"^[a-zA-Z]")
-_DEVANAGARI_PAT = re.compile(r"^[\u0900-\u097F]")
+_WS_RE = re.compile(r"\s+")
 
 
-def _split_words(text: str, lang: str) -> list[str]:
-    """Tokenise a sentence into words, stripping punctuation."""
-    pat = _ROMAN_PAT if lang == "roman" else _DEVANAGARI_PAT
-    cleaned = _PUNCT_RE.sub(" ", text)
-    return [w for w in cleaned.split() if w and pat.match(w)]
+def _is_devanagari(s: str) -> bool:
+    return bool(_DEVANAGARI_RE.search(s))
+
+
+def _detect_format(csv_path: str) -> tuple[str, int, int]:
+    """
+    Returns (format, roman_col, devan_col).
+    format is 'sentence' (has header, sentence-level) or 'word' (no header, word-level).
+    roman_col / devan_col are 0-based column indices.
+    """
+    with open(csv_path, encoding="utf-8") as f:
+        first = ""
+        for line in f:
+            line = line.strip()
+            if line:
+                first = line
+                break
+
+    if not first:
+        raise ValueError("CSV file appears empty.")
+
+    cols = first.split(",", 1)
+    if len(cols) < 2:
+        raise ValueError(f"CSV must have at least 2 columns. Got: {first!r}")
+
+    c0, c1 = cols[0].strip(), cols[1].strip()
+
+    # Header row detection
+    if "romanized" in c0.lower() or "roman" in c0.lower():
+        return "sentence", 0, 1   # Roman first, Devanagari second
+    if "devanagari" in c0.lower() or "nepali" in c0.lower():
+        return "sentence", 1, 0   # Devanagari first, Roman second
+    if "romanized" in c1.lower() or "roman" in c1.lower():
+        return "sentence", 1, 0
+
+    # No header — detect by content
+    if _is_devanagari(c0) and not _is_devanagari(c1):
+        return "word", 1, 0   # Devanagari first, Roman second
+    if _is_devanagari(c1) and not _is_devanagari(c0):
+        return "word", 0, 1   # Roman first, Devanagari second
+
+    # Default: assume Roman first
+    return "word", 0, 1
+
+
+# ── Word-pair extraction ──────────────────────────────────────────────────────
+def _split_sentence_words(roman: str, devan: str) -> list[tuple[str, str]]:
+    """Extract aligned (roman, devanagari) word pairs from a sentence pair."""
+    r_words = [w.lower() for w in _PUNCT_RE.sub(" ", roman).split()
+               if w and _ROMAN_RE.match(w)]
+    d_words = [w for w in _PUNCT_RE.sub(" ", devan).split()
+               if w and _DEVANAGARI_RE.match(w)]
+
+    if len(r_words) != len(d_words) or not r_words:
+        return []
+
+    return [(r, d) for r, d in zip(r_words, d_words)
+            if len(r) >= 2 and len(d) >= 1]
 
 
 def load_word_pairs(
     csv_path: str,
-    min_roman_len: int = 2,
-    min_devan_len: int = 1,
+    max_len_ratio: float = 4.0,
 ) -> tuple[list[tuple[str, str]], dict[str, str]]:
     """
-    Extract (roman_word, devanagari_word) pairs from a sentence-pair CSV.
+    Load (roman, devanagari) word pairs from a CSV file.
+    Auto-detects whether it is sentence-level or word-level, and
+    which column is Roman vs Devanagari.
 
-    Expected CSV columns: ``Romanized``, ``Devanagari``
+    Parameters
+    ----------
+    csv_path      : path to CSV file
+    max_len_ratio : drop pairs where len(devan) > ratio * len(roman)
+                    (removes noise that causes repetition loops)
 
     Returns
     -------
-    pairs
-        Deduplicated list of (roman, devanagari) tuples for training.
-    word_dict
-        Dict {roman: devanagari} for O(1) look-up at inference time.
+    pairs     : deduplicated list of (roman, devanagari)
+    word_dict : {roman: devanagari} for O(1) lookup at inference
     """
+    if not os.path.isfile(csv_path):
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
+
+    fmt, roman_col, devan_col = _detect_format(csv_path)
+    logger.info("CSV format detected: %s  roman_col=%d  devan_col=%d",
+                fmt, roman_col, devan_col)
+
     raw_pairs: list[tuple[str, str]] = []
-    rows_total = 0
-    skipped_empty = 0
-    skipped_mismatch = 0
+    skipped = 0
 
     with open(csv_path, encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows_total += 1
-            roman = (row.get("Romanized") or "").strip()
-            devan = (row.get("Devanagari") or "").strip()
+        # Skip header row if format is 'sentence'
+        content = f.read().strip().splitlines()
 
-            if not roman or not devan:
-                skipped_empty += 1
+    for line in content:
+        line = line.strip()
+        if not line:
+            continue
+
+        parts = line.split(",", max(roman_col, devan_col))
+        if len(parts) <= max(roman_col, devan_col):
+            skipped += 1
+            continue
+
+        roman_raw = parts[roman_col].strip()
+        devan_raw = parts[devan_col].strip()
+
+        # Skip header line (detected retroactively)
+        if not _is_devanagari(devan_raw) or not roman_raw:
+            skipped += 1
+            continue
+
+        if fmt == "sentence":
+            # Sentence-level: extract word pairs
+            pairs_from_line = _split_sentence_words(roman_raw, devan_raw)
+            raw_pairs.extend(pairs_from_line)
+        else:
+            # Word-level: use directly
+            roman_clean = roman_raw.lower().strip()
+            devan_clean = devan_raw.strip()
+
+            # Length ratio filter — kills the main repetition cause
+            if len(devan_clean) > max_len_ratio * max(len(roman_clean), 1):
+                skipped += 1
                 continue
+            if len(roman_clean) >= 2 and len(devan_clean) >= 1:
+                raw_pairs.append((roman_clean, devan_clean))
 
-            r_words = _split_words(roman, "roman")
-            d_words = _split_words(devan, "devanagari")
-
-            if len(r_words) == len(d_words) and r_words:
-                for rw, dw in zip(r_words, d_words):
-                    if len(rw) >= min_roman_len and len(dw) >= min_devan_len:
-                        raw_pairs.append((rw.lower(), dw))
-            else:
-                skipped_mismatch += 1
-
-    # Deduplicate — first occurrence wins (preserve original data ordering)
+    # Deduplicate: first occurrence wins
     seen: dict[str, str] = {}
     for roman, devan in raw_pairs:
         if roman not in seen:
@@ -202,61 +263,48 @@ def load_word_pairs(
 
     unique_pairs = list(seen.items())
 
-    print(
-        f"  CSV rows         : {rows_total:,}\n"
-        f"  Raw word pairs   : {len(raw_pairs):,}\n"
-        f"  Unique pairs     : {len(unique_pairs):,}\n"
-        f"  Skipped (empty)  : {skipped_empty:,}\n"
-        f"  Skipped (mismatch): {skipped_mismatch:,}"
+    logger.info(
+        "Loaded %d raw pairs → %d unique (skipped %d)",
+        len(raw_pairs), len(unique_pairs), skipped,
     )
+    if len(unique_pairs) == 0:
+        raise ValueError(
+            "No valid pairs extracted. Check column order and encoding."
+        )
 
     return unique_pairs, seen
 
 
-# ─── Data augmentation ────────────────────────────────────────────────────────
-
-_VOWELS = frozenset("aeiou")
-_ROMAN_CHARS = "abcdefghijklmnoprstuvwyz"   # plausible insert chars
+# ── Augmentation ──────────────────────────────────────────────────────────────
+_VOWELS      = frozenset("aeiou")
+_ROMAN_CHARS = "abcdefghijklmnoprstuvwyz"
 
 
 def _augment_one(roman: str, rng: random.Random) -> Optional[str]:
-    """
-    Apply ONE of four character-level noise ops to *roman*.
-    Returns the noisy string, or None if the word is too short / unchanged.
-    """
     if len(roman) < 3:
         return None
-
     word = list(roman)
-    n = len(word)
-    r = rng.random()
+    n    = len(word)
+    r    = rng.random()
 
     if r < 0.25:
-        # ① Duplicate a random vowel  (e.g. "name" → "naame")
-        v_idxs = [i for i, ch in enumerate(word) if ch in _VOWELS]
-        if v_idxs:
-            idx = rng.choice(v_idxs)
-            word.insert(idx + 1, word[idx])
+        vi = [i for i, c in enumerate(word) if c in _VOWELS]
+        if vi:
+            i = rng.choice(vi)
+            word.insert(i + 1, word[i])
         else:
             return None
-
     elif r < 0.50:
-        # ② Swap two adjacent characters  (e.g. "ghar" → "gahr")
-        idx = rng.randint(0, n - 2)
-        word[idx], word[idx + 1] = word[idx + 1], word[idx]
-
+        i = rng.randint(0, n - 2)
+        word[i], word[i+1] = word[i+1], word[i]
     elif r < 0.75:
-        # ③ Drop a repeated character  (e.g. "khamma" → "khama")
-        doubled = [i for i in range(1, n) if word[i] == word[i - 1]]
-        if doubled:
-            word.pop(rng.choice(doubled))
+        dd = [i for i in range(1, n) if word[i] == word[i-1]]
+        if dd:
+            word.pop(rng.choice(dd))
         else:
             return None
-
     else:
-        # ④ Insert a random plausible character (e.g. "keta" → "ketra")
-        idx = rng.randint(1, n - 1)
-        word.insert(idx, rng.choice(_ROMAN_CHARS))
+        word.insert(rng.randint(1, n-1), rng.choice(_ROMAN_CHARS))
 
     noisy = "".join(word)
     return noisy if noisy != roman and len(noisy) >= 2 else None
@@ -267,96 +315,58 @@ def augment_pairs(
     noise_prob: float = 1.0,
     seed: int = 42,
 ) -> list[tuple[str, str]]:
-    """
-    For each training pair, produce a noisy copy with probability *noise_prob*.
-
-    Parameters
-    ----------
-    pairs
-        Original (roman, devanagari) training pairs.
-    noise_prob
-        Probability in [0, 1] that a given pair is augmented.
-        0.0  → no augmentation at all.
-        1.0  → every eligible pair gets a noisy copy (≈ doubles the data).
-    seed
-        RNG seed for reproducibility.
-
-    Returns
-    -------
-    A list of ONLY the newly generated noisy pairs (append to originals yourself).
-    """
-    if noise_prob <= 0.0:
-        return []
-
+    """Return noisy copies of pairs (same target, perturbed source)."""
     rng = random.Random(seed)
-    augmented: list[tuple[str, str]] = []
-
+    out: list[tuple[str, str]] = []
     for roman, devan in pairs:
         if noise_prob < 1.0 and rng.random() > noise_prob:
-            continue                        # skip this pair — respects noise_prob
+            continue
         noisy = _augment_one(roman, rng)
-        if noisy is not None:
-            augmented.append((noisy, devan))
+        if noisy:
+            out.append((noisy, devan))
+    return out
 
-    return augmented
 
-
-# ─── PyTorch Dataset ─────────────────────────────────────────────────────────
-
+# ── Dataset ───────────────────────────────────────────────────────────────────
 class TransliterationDataset(Dataset):
     """
-    Character-level dataset.
-
-    src ids : Roman chars + EOS          (no SOS on encoder input)
-    tgt ids : SOS + Devanagari chars + EOS
+    src : roman chars + EOS          (no SOS — encoder reads full input)
+    tgt : SOS + devanagari + EOW + EOS
+    EOW gives the decoder a hard word-boundary signal that prevents
+    repetition loops common in open-vocabulary seq2seq.
     """
 
-    def __init__(
-        self,
-        pairs: list[tuple[str, str]],
-        src_tok: CharTokenizer,
-        tgt_tok: CharTokenizer,
-    ) -> None:
-        self.samples: list[tuple[list[int], list[int]]] = []
+    def __init__(self, pairs: list[tuple[str, str]],
+                 src_tok: CharTokenizer, tgt_tok: CharTokenizer,
+                 add_eow: bool = True) -> None:
+        self.data: list[tuple[list[int], list[int]]] = []
         for roman, devan in pairs:
             src = src_tok.encode(roman, add_sos=False, add_eos=True)
-            tgt = tgt_tok.encode(devan,  add_sos=True,  add_eos=True)
-            self.samples.append((src, tgt))
+            tgt = tgt_tok.encode(devan,  add_sos=True,  add_eos=True,
+                                  add_eow=add_eow)
+            self.data.append((src, tgt))
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.data)
 
-    def __getitem__(self, idx: int) -> tuple[list[int], list[int]]:
-        return self.samples[idx]
+    def __getitem__(self, idx: int):
+        return self.data[idx]
 
 
-def collate_fn(
-    batch: list[tuple[list[int], list[int]]],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Pad sequences in a batch to equal length and build padding masks.
-
-    Mask convention (matches nn.Transformer):
-        True  → IGNORE this position (padding token)
-        False → attend to this position
-    """
+def collate_fn(batch):
     src_list, tgt_list = zip(*batch)
-
+    B = len(batch)
     max_src = max(len(s) for s in src_list)
     max_tgt = max(len(t) for t in tgt_list)
-    B = len(batch)
 
-    src_padded = torch.full((B, max_src), PAD_IDX, dtype=torch.long)
-    tgt_padded = torch.full((B, max_tgt), PAD_IDX, dtype=torch.long)
+    src_pad = torch.full((B, max_src), PAD_IDX, dtype=torch.long)
+    tgt_pad = torch.full((B, max_tgt), PAD_IDX, dtype=torch.long)
 
     for i, (s, t) in enumerate(zip(src_list, tgt_list)):
-        src_padded[i, : len(s)] = torch.tensor(s, dtype=torch.long)
-        tgt_padded[i, : len(t)] = torch.tensor(t, dtype=torch.long)
+        src_pad[i, :len(s)] = torch.tensor(s, dtype=torch.long)
+        tgt_pad[i, :len(t)] = torch.tensor(t, dtype=torch.long)
 
-    src_pad_mask = src_padded.eq(PAD_IDX)   # (B, S_src)
-    tgt_pad_mask = tgt_padded.eq(PAD_IDX)   # (B, S_tgt)
-
-    return src_padded, tgt_padded, src_pad_mask, tgt_pad_mask
+    return src_pad, tgt_pad, src_pad.eq(PAD_IDX), tgt_pad.eq(PAD_IDX)
 
 
 def build_dataloaders(
@@ -367,51 +377,33 @@ def build_dataloaders(
     batch_size: int = 64,
     augment: bool = True,
     noise_prob: float = 1.0,
+    add_eow: bool = True,
     seed: int = 42,
     num_workers: int = 0,
-) -> tuple[DataLoader, DataLoader, list, list]:
-    """
-    Stratify-split pairs → train / val, optionally augment train, build DataLoaders.
+):
+    if not pairs:
+        raise ValueError("pairs is empty")
 
-    Returns
-    -------
-    train_loader, val_loader, train_pairs, val_pairs
-    """
-    rng = np.random.default_rng(seed)
-    idx = rng.permutation(len(pairs))
+    rng  = np.random.default_rng(seed)
+    idx  = rng.permutation(len(pairs))
     n_val = max(1, int(len(pairs) * val_split))
 
-    val_pairs   = [pairs[i] for i in idx[:n_val]]
-    train_pairs = [pairs[i] for i in idx[n_val:]]
+    val_p   = [pairs[i] for i in idx[:n_val]]
+    train_p = [pairs[i] for i in idx[n_val:]]
 
-    if augment and noise_prob > 0.0:
-        noisy = augment_pairs(train_pairs, noise_prob=noise_prob, seed=seed)
-        train_pairs = train_pairs + noisy   # original + noisy copies
+    if augment and noise_prob > 0:
+        noisy   = augment_pairs(train_p, noise_prob=noise_prob, seed=seed)
+        train_p = train_p + noisy
 
-    print(
-        f"  Train : {len(train_pairs):,} samples "
-        f"(augment={augment}, noise_prob={noise_prob})\n"
-        f"  Val   : {len(val_pairs):,} samples"
-    )
+    logger.info("DataLoaders: train=%d val=%d add_eow=%s", len(train_p), len(val_p), add_eow)
 
-    train_ds = TransliterationDataset(train_pairs, src_tok, tgt_tok)
-    val_ds   = TransliterationDataset(val_pairs,   src_tok, tgt_tok)
+    kw = dict(collate_fn=collate_fn, num_workers=num_workers,
+              pin_memory=(num_workers > 0))
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=num_workers,
-        pin_memory=num_workers > 0,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=num_workers,
-        pin_memory=num_workers > 0,
-    )
+    train_ds = TransliterationDataset(train_p, src_tok, tgt_tok, add_eow=add_eow)
+    val_ds   = TransliterationDataset(val_p,   src_tok, tgt_tok, add_eow=add_eow)
 
-    return train_loader, val_loader, train_pairs, val_pairs
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  **kw)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, **kw)
+
+    return train_loader, val_loader, train_p, val_p
