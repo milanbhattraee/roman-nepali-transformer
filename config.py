@@ -8,9 +8,13 @@ import os
 
 class Config:
     # ── Data ─────────────────────────────────────────────────────────────────
-    DATA_PATH   : str  = "/kaggle/input/roman-nepali-transliteration-data/roman_nepali_clean.csv"
-    MODEL_DIR   : str  = "models"
-    NUM_WORKERS : int  = 0
+    _KAGGLE_DATA = "/kaggle/input/roman-nepali-transliteration-data/roman_nepali_clean.csv"
+    _LOCAL_DATA  = "./data/roman_nepali_clean.csv"
+    
+    # Automatically switch paths based on environment
+    DATA_PATH   : str  = _KAGGLE_DATA if os.path.exists(_KAGGLE_DATA) else _LOCAL_DATA
+    MODEL_DIR   : str  = "/kaggle/working/models" if os.path.exists("/kaggle/working") else "models"
+    NUM_WORKERS : int  = 2
 
     # ── Architecture ─────────────────────────────────────────────────────────
     D_MODEL            : int   = 256
@@ -21,9 +25,9 @@ class Config:
     DROPOUT            : float = 0.1
     MAX_SEQ_LEN        : int   = 60
 
-    # ── Training ─────────────────────────────────────────────────────────────
+# ── Training ─────────────────────────────────────────────────────────────
     EPOCHS          : int   = 150
-    BATCH_SIZE      : int   = 64
+    BATCH_SIZE      : int   = 256  # CHANGED: 64 to 256 to drastically speed up training
     LEARNING_RATE   : float = 3e-4
     # WARMUP_STEPS = gradient-update steps, NOT epochs.
     # ~80-280 batches/epoch × 2000 ≈ 7-25 epochs of warmup.
@@ -40,9 +44,9 @@ class Config:
     AUGMENT     : bool  = True
     NOISE_PROB  : float = 1.0
 
-    # ── Evaluation ───────────────────────────────────────────────────────────
+# ── Evaluation ───────────────────────────────────────────────────────────
     EVAL_EVERY       : int = 1     # run validation every N epochs
-    MAX_EVAL_SAMPLES : int = 0     # 0 = use ALL validation pairs
+    MAX_EVAL_SAMPLES : int = 2000  # CHANGED: 0 to 2000 to keep validation under 2 minutes
 
     # ── Checkpointing ────────────────────────────────────────────────────────
     RESUME     : bool = True
