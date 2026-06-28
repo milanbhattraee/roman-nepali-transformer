@@ -7,6 +7,8 @@ import os
 
 
 class Config:
+
+    
     # ── Data ─────────────────────────────────────────────────────────────────
     _KAGGLE_DATA = "/kaggle/input/roman-nepali-transliteration-data/roman_nepali_clean.csv"
     _LOCAL_DATA  = "./data/roman_nepali_clean.csv"
